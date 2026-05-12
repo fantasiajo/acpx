@@ -5,6 +5,7 @@ import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   MAX_MESSAGE_BUFFER_SIZE,
+  resolveMaxMessageBufferSize,
   SessionQueueOwner,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -42,6 +43,15 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
     // no-op
   },
 };
+
+test("resolveMaxMessageBufferSize reads environment overrides", () => {
+  assert.equal(resolveMaxMessageBufferSize({ MAX_MESSAGE_BUFFER_SIZE: "1234" }), 1234);
+  assert.equal(resolveMaxMessageBufferSize({ ACPX_MAX_MESSAGE_BUFFER_SIZE: "5678" }), 5678);
+  assert.equal(
+    resolveMaxMessageBufferSize({ MAX_MESSAGE_BUFFER_SIZE: "invalid" }),
+    MAX_MESSAGE_BUFFER_SIZE,
+  );
+});
 
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
@@ -367,6 +377,65 @@ test("trySubmitToRunningOwner rejects oversized queue messages", async () => {
       stopProcess(keeper);
     }
   });
+});
+
+test("trySubmitToRunningOwner uses environment queue message buffer limit", async () => {
+  const originalLimit = process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE;
+  process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE = "128";
+  try {
+    await withTempHome(async (homeDir) => {
+      const sessionId = "submit-env-oversized-message";
+      const keeper = await startKeeperProcess();
+      const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+      });
+
+      const server = createSingleRequestServer((socket, request) => {
+        assert.equal(request.type, "submit_prompt");
+        socket.write(
+          `${JSON.stringify({
+            type: "accepted",
+            requestId: request.requestId,
+          })}\n`,
+        );
+        socket.write(`${"x".repeat(129)}\n`);
+      });
+
+      await listenServer(server, socketPath);
+
+      try {
+        await assert.rejects(
+          async () =>
+            await trySubmitToRunningOwner({
+              sessionId,
+              message: "hello",
+              permissionMode: "approve-reads",
+              outputFormatter: NOOP_OUTPUT_FORMATTER,
+              waitForCompletion: true,
+            }),
+          (error: unknown) => {
+            assert(error instanceof Error);
+            assert.match(error.message, /Message buffer exceeded 128 bytes/);
+            return true;
+          },
+        );
+      } finally {
+        await closeServer(server);
+        await cleanupOwnerArtifacts({ socketPath, lockPath });
+        stopProcess(keeper);
+      }
+    });
+  } finally {
+    if (originalLimit == null) {
+      delete process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE;
+    } else {
+      process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE = originalLimit;
+    }
+  }
 });
 
 test("trySubmitToRunningOwner streams queued lifecycle and returns result", async () => {
