@@ -40,6 +40,16 @@ import {
 
 export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
+export function resolveMaxMessageBufferSize(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.ACPX_MAX_MESSAGE_BUFFER_SIZE ?? env.MAX_MESSAGE_BUFFER_SIZE;
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed);
+    }
+  }
+  return MAX_MESSAGE_BUFFER_SIZE;
+}
 export {
   isProcessAlive,
   releaseQueueOwnerLease,
@@ -263,9 +273,10 @@ async function runQueueOwnerRequest<TResult>(options: {
     socket.on("data", (chunk: string) => {
       buffer += chunk;
 
-      if (buffer.length > MAX_MESSAGE_BUFFER_SIZE) {
+      const maxMessageBufferSize = resolveMaxMessageBufferSize();
+      if (buffer.length > maxMessageBufferSize) {
         socket.destroy();
-        finishReject(new Error(`Message buffer exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes`));
+        finishReject(new Error(`Message buffer exceeded ${maxMessageBufferSize} bytes`));
         return;
       }
 
