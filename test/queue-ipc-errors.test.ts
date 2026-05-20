@@ -4,8 +4,6 @@ import readline from "node:readline";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
-  MAX_MESSAGE_BUFFER_SIZE,
-  resolveMaxMessageBufferSize,
   SessionQueueOwner,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -46,15 +44,6 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
     // no-op
   },
 };
-
-test("resolveMaxMessageBufferSize reads environment overrides", () => {
-  assert.equal(resolveMaxMessageBufferSize({ MAX_MESSAGE_BUFFER_SIZE: "1234" }), 1234);
-  assert.equal(resolveMaxMessageBufferSize({ ACPX_MAX_MESSAGE_BUFFER_SIZE: "5678" }), 5678);
-  assert.equal(
-    resolveMaxMessageBufferSize({ MAX_MESSAGE_BUFFER_SIZE: "invalid" }),
-    MAX_MESSAGE_BUFFER_SIZE,
-  );
-});
 
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
@@ -333,9 +322,11 @@ test("trySubmitToRunningOwner surfaces disconnect-before-ack detail code", async
   });
 });
 
-test("trySubmitToRunningOwner rejects oversized queue messages", async () => {
+test("trySubmitToRunningOwner processes oversized queue messages", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-oversized-message";
+    const largeText = "x".repeat(10 * 1024 * 1024 + 1);
+    let acpMessageCount = 0;
     const keeper = await startKeeperProcess();
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
     await writeQueueOwnerLock({
@@ -353,92 +344,95 @@ test("trySubmitToRunningOwner rejects oversized queue messages", async () => {
           requestId: request.requestId,
         })}\n`,
       );
-      socket.write(`${"x".repeat(MAX_MESSAGE_BUFFER_SIZE + 1)}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "event",
+          requestId: request.requestId,
+          message: {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "agent-session",
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: largeText },
+              },
+            },
+          },
+        })}\n`,
+      );
+      socket.write(
+        `${JSON.stringify({
+          type: "result",
+          requestId: request.requestId,
+          result: {
+            stopReason: "end_turn",
+            sessionId: "agent-session",
+            permissionStats: {
+              requested: 1,
+              approved: 1,
+              denied: 0,
+              cancelled: 0,
+            },
+            resumed: true,
+            record: {
+              schema: "acpx.session.v1",
+              acpxRecordId: sessionId,
+              acpSessionId: "agent-session",
+              agentCommand: "mock-agent",
+              cwd: "/tmp/project",
+              createdAt: "2026-01-01T00:00:00.000Z",
+              lastUsedAt: "2026-01-01T00:00:00.000Z",
+              lastSeq: 2,
+              eventLog: {
+                active_path: "/tmp/session.stream.ndjson",
+                segment_count: 1,
+                max_segment_bytes: 1024,
+                max_segments: 1,
+                last_write_at: "2026-01-01T00:00:00.000Z",
+                last_write_error: null,
+              },
+              title: null,
+              messages: [],
+              updated_at: "2026-01-01T00:00:00.000Z",
+              cumulative_token_usage: {},
+              request_token_usage: {},
+            },
+          },
+        })}\n`,
+      );
+      socket.end();
     });
 
     await listenServer(server, socketPath);
 
     try {
-      await assert.rejects(
-        async () =>
-          await trySubmitToRunningOwner({
-            sessionId,
-            message: "hello",
-            permissionMode: "approve-reads",
-            outputFormatter: NOOP_OUTPUT_FORMATTER,
-            waitForCompletion: true,
-          }),
-        (error: unknown) => {
-          assert(error instanceof Error);
-          assert.match(error.message, /Message buffer exceeded/);
-          return true;
+      const result = await trySubmitToRunningOwner({
+        sessionId,
+        message: "hello",
+        permissionMode: "approve-reads",
+        outputFormatter: {
+          ...NOOP_OUTPUT_FORMATTER,
+          onAcpMessage() {
+            acpMessageCount += 1;
+          },
         },
-      );
+        waitForCompletion: true,
+      });
+
+      assert(result);
+      assert.equal("queued" in result, false);
+      if ("queued" in result) {
+        assert.fail("expected completed result, received queued response");
+      }
+      assert.equal(result.sessionId, "agent-session");
+      assert.equal(acpMessageCount, 1);
     } finally {
       await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }
   });
-});
-
-test("trySubmitToRunningOwner uses environment queue message buffer limit", async () => {
-  const originalLimit = process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE;
-  process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE = "128";
-  try {
-    await withTempHome(async (homeDir) => {
-      const sessionId = "submit-env-oversized-message";
-      const keeper = await startKeeperProcess();
-      const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
-      await writeQueueOwnerLock({
-        lockPath,
-        pid: keeper.pid,
-        sessionId,
-        socketPath,
-      });
-
-      const server = createSingleRequestServer((socket, request) => {
-        assert.equal(request.type, "submit_prompt");
-        socket.write(
-          `${JSON.stringify({
-            type: "accepted",
-            requestId: request.requestId,
-          })}\n`,
-        );
-        socket.write(`${"x".repeat(129)}\n`);
-      });
-
-      await listenServer(server, socketPath);
-
-      try {
-        await assert.rejects(
-          async () =>
-            await trySubmitToRunningOwner({
-              sessionId,
-              message: "hello",
-              permissionMode: "approve-reads",
-              outputFormatter: NOOP_OUTPUT_FORMATTER,
-              waitForCompletion: true,
-            }),
-          (error: unknown) => {
-            assert(error instanceof Error);
-            assert.match(error.message, /Message buffer exceeded 128 bytes/);
-            return true;
-          },
-        );
-      } finally {
-        await closeServer(server);
-        await cleanupOwnerArtifacts({ socketPath, lockPath });
-        stopProcess(keeper);
-      }
-    });
-  } finally {
-    if (originalLimit == null) {
-      delete process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE;
-    } else {
-      process.env.ACPX_MAX_MESSAGE_BUFFER_SIZE = originalLimit;
-    }
-  }
 });
 
 test("trySubmitToRunningOwner streams queued lifecycle and returns result", async () => {
