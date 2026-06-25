@@ -66,6 +66,9 @@ test("parseQueueRequest accepts prompt session options", () => {
       allowedTools: ["Read", "Grep"],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
+      env: {
+        GIT_AUTHOR_EMAIL: "agent@example.local",
+      },
     },
     waitForCompletion: true,
   });
@@ -85,6 +88,9 @@ test("parseQueueRequest accepts prompt session options", () => {
       allowedTools: ["Read", "Grep"],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
+      env: {
+        GIT_AUTHOR_EMAIL: "agent@example.local",
+      },
     },
   });
 });
@@ -228,7 +234,10 @@ test("parseQueueRequest accepts control requests and explicit prompt blocks", ()
       type: "submit_prompt",
       requestId: "req-prompt",
       message: "ignored text fallback",
-      prompt: [{ type: "text", text: "structured" }],
+      prompt: [
+        { type: "text", text: "structured" },
+        { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
+      ],
       permissionMode: "approve-all",
       suppressSdkConsoleErrors: false,
       waitForCompletion: false,
@@ -238,7 +247,10 @@ test("parseQueueRequest accepts control requests and explicit prompt blocks", ()
       requestId: "req-prompt",
       ownerGeneration: undefined,
       message: "ignored text fallback",
-      prompt: [{ type: "text", text: "structured" }],
+      prompt: [
+        { type: "text", text: "structured" },
+        { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
+      ],
       permissionMode: "approve-all",
       nonInteractivePermissions: undefined,
       timeoutMs: undefined,

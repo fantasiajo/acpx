@@ -3,6 +3,9 @@ import path from "node:path";
 import test from "node:test";
 import {
   AcpRuntimeError,
+  isRequestedModelUnsupportedError,
+  REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE,
+  RequestedModelUnsupportedError,
   decodeAcpxRuntimeHandleState,
   isAcpRuntimeError,
 } from "../src/runtime.js";
@@ -87,6 +90,13 @@ test("runtime errors preserve codes and can be identified safely", () => {
   assert.equal(isAcpRuntimeError(new Error("plain")), false);
 });
 
+test("runtime exports the model capability error signal", () => {
+  const error = new RequestedModelUnsupportedError("model unsupported", "missing-capability");
+  assert.equal(error.code, REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE);
+  assert.equal(error.reason, "missing-capability");
+  assert.equal(isRequestedModelUnsupportedError(error), true);
+});
+
 test("runtime lifecycle helpers update records from runtime snapshots and conversations", () => {
   const record = makeSessionRecord({
     acpxRecordId: "lifecycle-record",
@@ -102,7 +112,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
   applyLifecycleSnapshotToRecord(record, {
     pid: 321,
     startedAt: "2026-01-01T00:01:00.000Z",
-    running: true,
+    running: false,
     lastExit: {
       exitCode: 9,
       signal: "SIGKILL",
@@ -111,7 +121,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
       unexpectedDuringPrompt: false,
     },
   });
-  assert.equal(record.pid, 321);
+  assert.equal(record.pid, undefined);
   assert.equal(record.agentStartedAt, "2026-01-01T00:01:00.000Z");
   assert.equal(record.lastAgentExitCode, 9);
   assert.equal(record.lastAgentExitSignal, "SIGKILL");
@@ -146,6 +156,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
       },
     ],
     cumulative_token_usage: { input_tokens: 11 },
+    cumulative_cost: { amount: 0.02, currency: "USD" },
     request_token_usage: {
       req_1: {
         output_tokens: 22,
@@ -155,6 +166,7 @@ test("runtime lifecycle helpers update records from runtime snapshots and conver
   applyConversation(record, conversation);
   assert.equal(record.title, "Session title");
   assert.equal(record.updated_at, "2026-01-01T00:20:00.000Z");
+  assert.deepEqual(record.cumulative_cost, { amount: 0.02, currency: "USD" });
   assert.equal(sessionHasAgentMessages(conversation), true);
   assert.equal(
     sessionHasAgentMessages({

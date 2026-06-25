@@ -1,11 +1,17 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
+import { splitCommandLine } from "../../acp/client-process.js";
+import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import {
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
+import { currentModelIdFromSetModelResponse } from "../../session/model-application.js";
+import { advertisedModelState } from "../../session/model-state.js";
 import { resolveSessionRecord, writeSessionRecord, isoNow } from "../../session/persistence.js";
 import type {
   SessionRecord,
@@ -35,6 +41,8 @@ import {
   runSessionSetModelDirect,
   runSessionSetModeDirect,
 } from "./prompt-runner.js";
+
+const execFileAsync = promisify(execFile);
 
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
@@ -89,11 +97,16 @@ export async function setSessionModel(
   );
   if (submittedToOwner) {
     const record = await resolveSessionRecord(options.sessionId);
-    setDesiredModelId(record, options.modelId);
-    setCurrentModelId(record, options.modelId);
+    applyConfigOptionsToRecord(record, submittedToOwner.response);
+    setDesiredModelId(record, options.modelId, advertisedModelState(record.acpx)?.configId);
+    setCurrentModelId(
+      record,
+      currentModelIdFromSetModelResponse(submittedToOwner.response, options.modelId),
+    );
     await writeSessionRecord(record);
     return {
       record,
+      response: submittedToOwner.response,
       resumed: false,
     };
   }
@@ -123,7 +136,12 @@ export async function setSessionConfigOption(
   );
   if (ownerResponse) {
     const record = await resolveSessionRecord(options.sessionId);
-    if (options.configId === "mode") {
+    const modelConfigId = advertisedModelState(record.acpx)?.configId;
+    applyConfigOptionsToRecord(record, ownerResponse);
+    if (options.configId === modelConfigId) {
+      setDesiredModelId(record, options.value, options.configId);
+      setCurrentModelId(record, currentModelIdFromSetModelResponse(ownerResponse, options.value));
+    } else if (options.configId === "mode") {
       setDesiredModeId(record, options.value);
     } else {
       setDesiredConfigOption(record, options.configId, options.value);
@@ -151,12 +169,12 @@ export async function setSessionConfigOption(
 }
 
 function firstAgentCommandToken(command: string): string | undefined {
-  const trimmed = command.trim();
-  if (!trimmed) {
+  try {
+    const parsed = splitCommandLine(command);
+    return parsed.command || undefined;
+  } catch {
     return undefined;
   }
-  const token = trimmed.split(/\s+/, 1)[0];
-  return token.length > 0 ? token : undefined;
 }
 
 async function isLikelyMatchingProcess(pid: number, agentCommand: string): Promise<boolean> {
@@ -165,26 +183,86 @@ async function isLikelyMatchingProcess(pid: number, agentCommand: string): Promi
     return false;
   }
 
-  const procCmdline = `/proc/${pid}/cmdline`;
+  const argv = await readProcessArgv(pid);
+  if (argv.length === 0) {
+    return false;
+  }
+
+  const executableBase = path.basename(argv[0]);
+  const expectedBase = path.basename(expectedToken);
+  return (
+    executableBase === expectedBase || argv.some((entry) => path.basename(entry) === expectedBase)
+  );
+}
+
+async function readProcessArgv(pid: number): Promise<string[]> {
+  const procArgv = await readProcCmdline(pid);
+  if (procArgv) {
+    return procArgv;
+  }
+
+  const commandLine =
+    process.platform === "win32"
+      ? await readWindowsCommandLine(pid)
+      : await readPosixCommandLine(pid);
+  return splitCommandLineLike(commandLine);
+}
+
+async function readProcCmdline(pid: number): Promise<string[] | undefined> {
   try {
-    const payload = await fs.readFile(procCmdline, "utf8");
-    const argv = payload
+    const payload = await fs.readFile(`/proc/${pid}/cmdline`, "utf8");
+    return payload
       .split("\u0000")
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
-    if (argv.length === 0) {
-      return false;
-    }
-
-    const executableBase = path.basename(argv[0]);
-    const expectedBase = path.basename(expectedToken);
-    return (
-      executableBase === expectedBase || argv.some((entry) => path.basename(entry) === expectedBase)
-    );
   } catch {
-    return true;
+    return undefined;
   }
 }
+
+async function readPosixCommandLine(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readWindowsCommandLine(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`,
+      ],
+      { windowsHide: true },
+    );
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function splitCommandLineLike(commandLine: string | undefined): string[] {
+  if (!commandLine) {
+    return [];
+  }
+  try {
+    const parsed = splitCommandLine(commandLine);
+    return [parsed.command, ...parsed.args];
+  } catch {
+    return commandLine
+      .split(/\s+/u)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+}
+
+export const sessionControlTestInternals = { firstAgentCommandToken, splitCommandLineLike };
 
 export async function closeSession(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);

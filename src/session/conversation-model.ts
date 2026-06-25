@@ -13,15 +13,18 @@ import type {
   PromptInput,
   SessionAcpxState,
   SessionConversation,
+  SessionAvailableCommand,
   SessionAgentContent,
   SessionAgentMessage,
   SessionMessage,
   SessionTokenUsage,
+  SessionUsageCost,
   SessionToolResult,
   SessionToolResultContent,
   SessionToolUse,
   SessionUserContent,
 } from "../types.js";
+import { applyConfigOptionsModelState } from "./model-state.js";
 
 export type LegacyHistoryEntry = {
   role: "user" | "assistant";
@@ -52,6 +55,10 @@ function hasOwn(source: object, key: string): boolean {
 }
 
 function normalizeAgentName(value: unknown): string | undefined {
+  return trimmedString(value);
+}
+
+function trimmedString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -59,23 +66,42 @@ function normalizeAgentName(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function normalizeAvailableCommand(value: unknown): SessionAvailableCommand | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  const name = trimmedString(record.name);
+  if (!name) {
+    return undefined;
+  }
+  const description = trimmedString(record.description);
+  return {
+    name,
+    ...(description ? { description } : {}),
+    has_input: record.input != null,
+  };
+}
+
 function extractText(content: ContentBlock): string | undefined {
-  if (content.type === "text") {
-    return content.text;
+  switch (content.type) {
+    case "text":
+      return content.text;
+    case "resource_link":
+      return content.title ?? content.name ?? content.uri;
+    case "resource":
+      return extractResourceText(content);
+    case "audio":
+      return `[audio] ${content.mimeType}`;
+    default:
+      return undefined;
   }
+}
 
-  if (content.type === "resource_link") {
-    return content.title ?? content.name ?? content.uri;
-  }
-
-  if (content.type === "resource") {
-    if ("text" in content.resource && typeof content.resource.text === "string") {
-      return content.resource.text;
-    }
-    return content.resource.uri;
-  }
-
-  return undefined;
+function extractResourceText(content: Extract<ContentBlock, { type: "resource" }>): string {
+  return "text" in content.resource && typeof content.resource.text === "string"
+    ? content.resource.text
+    : content.resource.uri;
 }
 
 function contentToUserContent(content: ContentBlock): SessionUserContent | undefined {
@@ -104,6 +130,15 @@ function contentToUserContent(content: ContentBlock): SessionUserContent | undef
       Image: {
         source: content.data,
         size: null,
+      },
+    };
+  }
+
+  if (content.type === "audio") {
+    return {
+      Audio: {
+        source: content.data,
+        mime_type: content.mimeType,
       },
     };
   }
@@ -407,27 +442,27 @@ function numberField(source: Record<string, unknown>, keys: readonly string[]): 
   return undefined;
 }
 
-function usageToTokenUsage(update: UsageUpdate): SessionTokenUsage | undefined {
-  const updateRecord = asRecord(update);
-  const usageMeta = asRecord(updateRecord?._meta)?.usage;
-  const source = asRecord(usageMeta) ?? updateRecord;
-  if (!source) {
+function sourceToTokenUsage(source: unknown): SessionTokenUsage | undefined {
+  const usageRecord = asRecord(source);
+  if (!usageRecord) {
     return undefined;
   }
 
   const normalized: SessionTokenUsage = {
-    input_tokens: numberField(source, ["input_tokens", "inputTokens"]),
-    output_tokens: numberField(source, ["output_tokens", "outputTokens"]),
-    cache_creation_input_tokens: numberField(source, [
+    input_tokens: numberField(usageRecord, ["input_tokens", "inputTokens"]),
+    output_tokens: numberField(usageRecord, ["output_tokens", "outputTokens"]),
+    cache_creation_input_tokens: numberField(usageRecord, [
       "cache_creation_input_tokens",
       "cacheCreationInputTokens",
       "cachedWriteTokens",
     ]),
-    cache_read_input_tokens: numberField(source, [
+    cache_read_input_tokens: numberField(usageRecord, [
       "cache_read_input_tokens",
       "cacheReadInputTokens",
       "cachedReadTokens",
     ]),
+    thought_tokens: numberField(usageRecord, ["thought_tokens", "thoughtTokens"]),
+    total_tokens: numberField(usageRecord, ["total_tokens", "totalTokens"]),
   };
 
   if (!hasTokenUsageValue(normalized)) {
@@ -437,8 +472,42 @@ function usageToTokenUsage(update: UsageUpdate): SessionTokenUsage | undefined {
   return normalized;
 }
 
+function usageToTokenUsage(update: UsageUpdate): SessionTokenUsage | undefined {
+  const updateRecord = asRecord(update);
+  const usageMeta = asRecord(updateRecord?._meta)?.usage;
+  const source = asRecord(usageMeta) ?? updateRecord;
+  if (!source) {
+    return undefined;
+  }
+
+  return sourceToTokenUsage(source);
+}
+
 function hasTokenUsageValue(usage: SessionTokenUsage): boolean {
   return Object.values(usage).some((value) => value !== undefined);
+}
+
+function usageCost(update: UsageUpdate): SessionUsageCost | undefined {
+  const cost = asRecord(asRecord(update)?.cost);
+  if (!cost) {
+    return undefined;
+  }
+  return buildUsageCost(numberField(cost, ["amount"]), stringField(cost.currency));
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function buildUsageCost(
+  amount: number | undefined,
+  currency: string | undefined,
+): SessionUsageCost | undefined {
+  const cost: SessionUsageCost = {
+    ...(amount !== undefined ? { amount } : {}),
+    ...(currency !== undefined ? { currency } : {}),
+  };
+  return Object.keys(cost).length > 0 ? cost : undefined;
 }
 
 function ensureAcpxState(state: SessionAcpxState | undefined): SessionAcpxState {
@@ -461,6 +530,7 @@ export function createSessionConversation(timestamp = isoNow()): SessionConversa
     messages: [],
     updated_at: timestamp,
     cumulative_token_usage: {},
+    cumulative_cost: undefined,
     request_token_usage: {},
   };
 }
@@ -477,8 +547,13 @@ export function cloneSessionConversation(
     messages: deepClone(conversation.messages ?? []),
     updated_at: conversation.updated_at,
     cumulative_token_usage: deepClone(conversation.cumulative_token_usage ?? {}),
+    cumulative_cost: cloneUsageCost(conversation.cumulative_cost),
     request_token_usage: deepClone(conversation.request_token_usage ?? {}),
   };
+}
+
+function cloneUsageCost(cost: SessionUsageCost | undefined): SessionUsageCost | undefined {
+  return cost ? { ...cost } : undefined;
 }
 
 export function cloneSessionAcpxState(
@@ -496,7 +571,10 @@ export function cloneSessionAcpxState(
       : undefined,
     current_model_id: state.current_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
-    available_commands: state.available_commands ? [...state.available_commands] : undefined,
+    model_control: state.model_control,
+    available_commands: state.available_commands
+      ? state.available_commands.map((command) => ({ ...command }))
+      : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     session_options: cloneSessionOptions(state.session_options),
   };
@@ -515,6 +593,7 @@ function cloneSessionOptions(
     ...(options.system_prompt !== undefined
       ? { system_prompt: cloneSystemPromptOption(options.system_prompt) }
       : {}),
+    ...(options.env !== undefined ? { env: { ...options.env } } : {}),
   };
 }
 
@@ -628,6 +707,23 @@ export function recordSessionUpdate(
   return acpx;
 }
 
+export function recordPromptResponseUsage(
+  conversation: SessionConversation,
+  usage: unknown,
+  promptMessageId?: string,
+  timestamp = isoNow(),
+): boolean {
+  const tokenUsage = sourceToTokenUsage(usage);
+  if (!tokenUsage) {
+    return false;
+  }
+
+  applyTokenUsage(conversation, tokenUsage, promptMessageId);
+  updateConversationTimestamp(conversation, timestamp);
+  trimConversationForRuntime(conversation);
+  return true;
+}
+
 function applySessionUpdate(
   conversation: SessionConversation,
   acpx: SessionAcpxState,
@@ -682,8 +778,8 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
   available_commands_update: (_conversation, acpx, update) => {
     if (update.sessionUpdate === "available_commands_update") {
       acpx.available_commands = update.availableCommands
-        .map((entry) => entry.name)
-        .filter((entry) => typeof entry === "string" && entry.trim().length > 0);
+        .map((entry) => normalizeAvailableCommand(entry))
+        .filter((entry): entry is SessionAvailableCommand => entry !== undefined);
     }
   },
   current_mode_update: (_conversation, acpx, update) => {
@@ -693,7 +789,8 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
   },
   config_option_update: (_conversation, acpx, update) => {
     if (update.sessionUpdate === "config_option_update") {
-      acpx.config_options = deepClone(update.configOptions);
+      const configOptions = deepClone(update.configOptions);
+      applyConfigOptionsModelState(acpx, configOptions);
     }
   },
 };
@@ -724,11 +821,25 @@ function appendAgentMessageChunk(
 
 function applyUsageUpdate(conversation: SessionConversation, update: UsageUpdate): void {
   const usage = usageToTokenUsage(update);
-  if (!usage) {
+  const cost = usageCost(update);
+  if (!usage && !cost) {
     return;
   }
+  if (usage) {
+    applyTokenUsage(conversation, usage);
+  }
+  if (cost) {
+    conversation.cumulative_cost = cost;
+  }
+}
+
+function applyTokenUsage(
+  conversation: SessionConversation,
+  usage: SessionTokenUsage,
+  promptMessageId?: string,
+): void {
   conversation.cumulative_token_usage = usage;
-  const userId = lastUserMessageId(conversation);
+  const userId = promptMessageId ?? lastUserMessageId(conversation);
   if (userId) {
     conversation.request_token_usage[userId] = usage;
   }

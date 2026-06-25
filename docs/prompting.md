@@ -121,20 +121,14 @@ acpx --model gpt-5.4 codex exec 'one-shot summary'
 Behavior varies by adapter:
 
 - **Claude** consumes the value as session-creation metadata.
-- Other agents must advertise ACP models and support `session/set_model`. If they do not, `acpx` fails clearly instead of silently falling back to the adapter's default.
-- Model ids must appear in the adapter's advertised `availableModels`. Unknown ids are rejected.
+- Other agents must advertise a model session config option or legacy `models` metadata. Config options use `session/set_config_option`; explicitly advertised legacy models use `session/set_model`.
+- Model ids must appear in the adapter's advertised values. Unknown ids are rejected.
+- Cursor may advertise model variants with bracketed settings such as
+  `composer-2.5[fast=false]`. When exactly one advertised Cursor id has the requested
+  bare model as its prefix, `acpx` forwards that advertised id automatically; ambiguous
+  variants remain rejected.
 
 For mid-session model switches, use `set model <id>` instead. See [Session control](session-control.md#set-key-value).
-
-## Codex compatibility aliases
-
-Some Codex-specific knobs are surfaced through generic ACP methods:
-
-```bash
-acpx codex set thought_level high     # alias -> codex-acp `reasoning_effort`
-```
-
-`thought_level` is intercepted and translated. Other keys pass through as-is via `session/set_config_option`.
 
 ## Permissions inside a prompt
 

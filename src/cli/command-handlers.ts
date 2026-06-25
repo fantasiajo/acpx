@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { isCodexInvocation } from "../acp/codex-compat.js";
+import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
+import { AgentSpawnError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -9,6 +10,8 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
+import { exportSession } from "../session/export.js";
+import { importSession } from "../session/import.js";
 import {
   findGitRepositoryRoot,
   findSession,
@@ -33,13 +36,17 @@ import {
   resolveSessionNameFromFlags,
   type ExecFlags,
   type GlobalFlags,
+  type SessionsExportFlags,
   type PromptFlags,
+  type SessionsImportFlags,
   type SessionsHistoryFlags,
+  type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
   type StatusFlags,
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
+import type { SessionListResult } from "./session/contracts.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -146,11 +153,8 @@ function applyPermissionExitCode(result: {
   }
 }
 
-function resolveCompatibleConfigId(
-  agent: { agentName: string; agentCommand: string },
-  configId: string,
-): string {
-  if (isCodexInvocation(agent.agentName, agent.agentCommand) && configId === "thought_level") {
+function resolveCompatibleConfigId(agent: { agentCommand: string }, configId: string): string {
+  if (isLegacyZedCodexAcpInvocation(agent.agentCommand) && configId === "thought_level") {
     return "reasoning_effort";
   }
   return configId;
@@ -214,7 +218,31 @@ function buildSessionStartOptions(params: {
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+    onModelWarning: params.globalFlags.jsonStrict
+      ? undefined
+      : (message) => process.stderr.write(`[acpx] warning: ${message}\n`),
   };
+}
+
+function resolveSessionListFilterCwd(
+  flags: Pick<SessionsListFlags, "filterCwd">,
+  agentCwd: string,
+): string | undefined {
+  return flags.filterCwd ? path.resolve(agentCwd, flags.filterCwd) : undefined;
+}
+
+async function printLocalSessionsList(
+  agentCommand: string,
+  filterCwd: string | undefined,
+  format: OutputFormat,
+): Promise<void> {
+  const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
+    loadSessionModule(),
+    loadOutputRenderModule(),
+  ]);
+  const sessions = await listSessionsForAgent(agentCommand);
+  const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
+  printSessionsByFormat(filtered, format);
 }
 
 function missingScopedSessionMessage(
@@ -294,7 +322,7 @@ export async function handlePrompt(
     agent.agentCommand,
     agent.agentName,
     agent.cwd,
-    flags.session,
+    resolveSessionNameFromFlags(flags, command),
   );
   const outputFormatter = createOutputFormatter(outputPolicy.format, {
     jsonContext: {
@@ -308,6 +336,8 @@ export async function handlePrompt(
     sessionId: record.acpxRecordId,
     prompt,
     mcpServers: config.mcpServers,
+    mcpConfigPath: config.mcpConfigPath,
+    mcpConfigFingerprint: config.mcpConfigFingerprint,
     permissionMode,
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     permissionPolicy,
@@ -341,7 +371,9 @@ export async function handlePrompt(
   applyPermissionExitCode(result);
 
   if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
+    process.stderr.write(
+      `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
+    );
   }
 }
 
@@ -563,7 +595,9 @@ export async function handleSetMode(
   });
 
   if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
+    process.stderr.write(
+      `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
+    );
   }
 
   printSetModeResultByFormat(modeId, result, globalFlags.format);
@@ -598,7 +632,9 @@ export async function handleSetModel(
   });
 
   if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
+    process.stderr.write(
+      `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
+    );
   }
 
   printSetModelResultByFormat(modelId, result, globalFlags.format);
@@ -640,25 +676,81 @@ export async function handleSetConfigOption(
   });
 
   if (globalFlags.verbose && result.loadError) {
-    process.stderr.write(`[acpx] loadSession failed, started fresh session: ${result.loadError}\n`);
+    process.stderr.write(
+      `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
+    );
   }
 
   printSetConfigOptionResultByFormat(configId, value, result, globalFlags.format);
 }
 
+async function tryListAgentSessions(
+  agent: ResolvedAgentInvocation,
+  flags: SessionsListFlags,
+  globalFlags: ReturnType<typeof resolveGlobalFlags>,
+  config: ResolvedAcpxConfig,
+): Promise<SessionListResult | "spawn-failed"> {
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const { listAgentSessions } = await loadSessionModule();
+  try {
+    return await listAgentSessions({
+      agentCommand: agent.agentCommand,
+      cwd: agent.cwd,
+      cursor: flags.cursor,
+      filterCwd: resolveSessionListFilterCwd(flags, agent.cwd),
+      mcpServers: config.mcpServers,
+      permissionMode,
+      nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+      permissionPolicy,
+      authCredentials: config.auth,
+      authPolicy: globalFlags.authPolicy,
+      terminal: globalFlags.terminal,
+      timeoutMs: globalFlags.timeout,
+      verbose: globalFlags.verbose,
+    });
+  } catch (error) {
+    if (error instanceof AgentSpawnError) {
+      return "spawn-failed";
+    }
+    throw error;
+  }
+}
+
 export async function handleSessionsList(
   explicitAgentName: string | undefined,
+  flags: SessionsListFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
-    loadSessionModule(),
+  const filterCwd = resolveSessionListFilterCwd(flags, agent.cwd);
+
+  if (flags.local) {
+    if (flags.cursor) {
+      throw new InvalidArgumentError("--cursor cannot be combined with --local");
+    }
+    await printLocalSessionsList(agent.agentCommand, filterCwd, globalFlags.format);
+    return;
+  }
+
+  const [result, { printAgentSessionsByFormat }] = await Promise.all([
+    tryListAgentSessions(agent, flags, globalFlags, config),
     loadOutputRenderModule(),
   ]);
-  const sessions = await listSessionsForAgent(agent.agentCommand);
-  printSessionsByFormat(sessions, globalFlags.format);
+
+  if (!result || result === "spawn-failed") {
+    if (result !== "spawn-failed" && (flags.cursor || flags.filterCwd)) {
+      throw new Error(
+        `Agent command "${agent.agentCommand}" does not advertise sessionCapabilities.list; cannot use agent-side session/list filters`,
+      );
+    }
+    await printLocalSessionsList(agent.agentCommand, undefined, globalFlags.format);
+    return;
+  }
+
+  printAgentSessionsByFormat(result, globalFlags.format);
 }
 
 export async function handleSessionsClose(
@@ -779,6 +871,9 @@ function userContentToText(content: SessionUserContent): string {
   }
   if ("Image" in content) {
     return content.Image.source || "[image]";
+  }
+  if ("Audio" in content) {
+    return `[audio] ${content.Audio.mime_type || "audio"}`;
   }
   return "";
 }
@@ -945,6 +1040,78 @@ export async function handleSessionsHistory(
   const record = await findScopedSessionOrThrow(agent, sessionName);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
+}
+
+export async function handleSessionsExport(
+  explicitAgentName: string | undefined,
+  sessionName: string | undefined,
+  flags: SessionsExportFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const cwd = flags.sourceCwd ? path.resolve(agent.cwd, flags.sourceCwd) : agent.cwd;
+
+  await exportSession(
+    {
+      agentName: globalFlags.agent ? undefined : agent.agentName,
+      agentCommand: agent.agentCommand,
+      cwd,
+      name: sessionName,
+    },
+    flags.output,
+  );
+
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "session_exported",
+      output: flags.output,
+    })
+  ) {
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${flags.output}\n`);
+    return;
+  }
+
+  process.stdout.write(`exported session to ${flags.output}\n`);
+}
+
+export async function handleSessionsImport(
+  explicitAgentName: string | undefined,
+  archivePath: string,
+  flags: SessionsImportFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const result = await importSession(archivePath, {
+    name: flags.name,
+    newCwd: flags.destinationCwd ? path.resolve(globalFlags.cwd, flags.destinationCwd) : undefined,
+    expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
+    expectedAgentCommand: agent.agentCommand,
+  });
+
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "session_imported",
+      record_id: result.record_id,
+      cwd: result.cwd,
+    })
+  ) {
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${result.record_id}\n`);
+    return;
+  }
+
+  process.stdout.write(`imported session ${result.record_id} at ${result.cwd}\n`);
 }
 
 export async function handleSessionsPrune(

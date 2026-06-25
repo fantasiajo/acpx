@@ -98,7 +98,10 @@ export type QueueOwnerControlHandlers = {
   cancelPrompt: () => Promise<boolean>;
   closeSession: (timeoutMs?: number) => Promise<boolean>;
   setSessionMode: (modeId: string, timeoutMs?: number) => Promise<void>;
-  setSessionModel: (modelId: string, timeoutMs?: number) => Promise<void>;
+  setSessionModel: (
+    modelId: string,
+    timeoutMs?: number,
+  ) => Promise<SetSessionConfigOptionResponse | undefined>;
   setSessionConfigOption: (
     configId: string,
     value: string,
@@ -244,50 +247,47 @@ export class SessionQueueOwner {
     this.onQueueDepthChanged?.(this.pending.length);
   }
 
-  private enqueue(task: QueueTask): void {
+  private enqueue(task: QueueTask): boolean {
     if (this.closed) {
-      if (task.waitForCompletion) {
-        task.send(
-          makeQueueOwnerError(
-            task.requestId,
-            "Queue owner is shutting down",
-            "QUEUE_OWNER_SHUTTING_DOWN",
-            {
-              retryable: true,
-            },
-          ),
-        );
-      }
+      task.send(
+        makeQueueOwnerError(
+          task.requestId,
+          "Queue owner is shutting down",
+          "QUEUE_OWNER_SHUTTING_DOWN",
+          {
+            retryable: true,
+          },
+        ),
+      );
       task.close();
-      return;
+      return false;
     }
 
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter(task);
-      return;
+      return true;
     }
 
     if (this.pending.length >= this.maxQueueDepth) {
-      if (task.waitForCompletion) {
-        task.send({
-          ...makeQueueOwnerError(
-            task.requestId,
-            `Queue owner is overloaded (${this.pending.length}/${this.maxQueueDepth} queued)`,
-            "QUEUE_OWNER_OVERLOADED",
-            {
-              retryable: true,
-            },
-          ),
-          ownerGeneration: this.ownerGeneration,
-        });
-      }
+      task.send({
+        ...makeQueueOwnerError(
+          task.requestId,
+          `Queue owner is overloaded (${this.pending.length}/${this.maxQueueDepth} queued)`,
+          "QUEUE_OWNER_OVERLOADED",
+          {
+            retryable: true,
+          },
+        ),
+        ownerGeneration: this.ownerGeneration,
+      });
       task.close();
-      return;
+      return false;
     }
 
     this.pending.push(task);
     this.emitQueueDepth();
+    return true;
   }
 
   private handleControlRequest<TMessage extends QueueOwnerMessage>(options: {
@@ -427,11 +427,15 @@ export class SessionQueueOwner {
         socket,
         requestId: request.requestId,
         run: async () => {
-          await this.controlHandlers.setSessionModel(request.modelId, request.timeoutMs);
+          const response = await this.controlHandlers.setSessionModel(
+            request.modelId,
+            request.timeoutMs,
+          );
           return {
             type: "set_model_result",
             requestId: request.requestId,
             modelId: request.modelId,
+            response,
           };
         },
       });
@@ -487,17 +491,19 @@ export class SessionQueueOwner {
       },
     };
 
+    const enqueued = this.enqueue(task);
+    if (!enqueued) {
+      return;
+    }
+
     writeQueueMessage(socket, {
       type: "accepted",
       requestId: request.requestId,
       ownerGeneration: this.ownerGeneration,
     });
-
     if (!request.waitForCompletion) {
       task.close();
     }
-
-    this.enqueue(task);
   }
 
   private handleConnection(socket: net.Socket): void {

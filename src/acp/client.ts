@@ -3,11 +3,15 @@ import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
+  RequestError,
   type AnyMessage,
   type AuthMethod,
+  type ClientCapabilities,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type InitializeResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
   type KillTerminalRequest,
   type KillTerminalResponse,
   type LoadSessionResponse,
@@ -16,6 +20,7 @@ import {
   type ReadTextFileResponse,
   type ReleaseTerminalRequest,
   type ReleaseTerminalResponse,
+  type ResumeSessionResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -27,7 +32,6 @@ import {
   type WriteTextFileRequest,
   type WriteTextFileResponse,
   type SessionConfigOption,
-  type SessionModelState,
 } from "@agentclientprotocol/sdk";
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
@@ -40,6 +44,7 @@ import {
   GeminiAcpStartupTimeoutError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
+  UnsupportedPromptContentError,
 } from "../errors.js";
 import { FileSystemHandlers } from "../filesystem.js";
 import {
@@ -48,7 +53,7 @@ import {
   inferToolKind,
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
-import { textPrompt } from "../prompt-content.js";
+import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
@@ -58,6 +63,7 @@ import type {
   PermissionStats,
   PromptInput,
 } from "../types.js";
+import { getAcpxVersion } from "../version.js";
 import {
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
@@ -66,11 +72,13 @@ import {
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
   isCopilotAcpCommand,
+  isDevinAcpCommand,
   isGeminiAcpCommand,
   isQoderAcpCommand,
   resolveAgentCloseAfterStdinEndMs,
   resolveClaudeAcpSessionCreateTimeoutMs,
   resolveClaudeCodeExecutable,
+  resolveClaudeCodeSettingSources,
   resolveGeminiAcpStartupTimeoutMs,
   resolveGeminiCommandArgs,
   shouldIgnoreNonJsonAgentOutputLine,
@@ -91,7 +99,14 @@ import {
   waitForSpawn,
 } from "./client-process.js";
 import { extractAcpError } from "./error-shapes.js";
-import { isSessionUpdateNotification } from "./jsonrpc.js";
+import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
+import {
+  modelStateFromConfigOptions,
+  modelStateFromSessionResponse,
+  RequestedModelUnsupportedError,
+  resolveRequestedModelId,
+  type SessionModelState,
+} from "./model-support.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -103,6 +118,7 @@ export {
   buildAgentSpawnOptions,
   buildQoderAcpCommandArgs,
   resolveAgentCloseAfterStdinEndMs,
+  resolveClaudeCodeSettingSources,
   shouldIgnoreNonJsonAgentOutputLine,
 };
 
@@ -112,6 +128,52 @@ const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
+const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
+  "cognition.ai/requestDiagnostics": true,
+});
+const DEVIN_COMPATIBILITY_CLIENT_NAME = "windsurf";
+// This is the embedded Windsurf IDE version bundled with Devin Desktop 3.1.7, the first locally verified version that passes Devin's server-side ACP precondition.
+const DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION = "1.110.1";
+
+function resolveClientInfo(devinAcp: boolean): { name: string; version: string } {
+  if (!devinAcp) {
+    return {
+      name: "acpx",
+      version: getAcpxVersion(),
+    };
+  }
+
+  return {
+    name: DEVIN_COMPATIBILITY_CLIENT_NAME,
+    version: process.env.ACPX_DEVIN_WINDSURF_VERSION ?? DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION,
+  };
+}
+
+function resolveClientCapabilities(params: {
+  devinAcp: boolean;
+  terminal: boolean;
+}): ClientCapabilities {
+  const baseCapabilities: ClientCapabilities = {
+    fs: {
+      readTextFile: true,
+      writeTextFile: true,
+    },
+    terminal: params.terminal,
+  };
+
+  if (!params.devinAcp) {
+    return baseCapabilities;
+  }
+
+  return {
+    ...baseCapabilities,
+    _meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META,
+  };
+}
+
+function isDevinRequestDiagnosticsMethod(method: string): boolean {
+  return method === "_cognition.ai/request_diagnostics";
+}
 
 type LoadSessionOptions = {
   suppressReplayUpdates?: boolean;
@@ -124,19 +186,45 @@ export type SessionCreateResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  configOptionsPresent: boolean;
+  legacyModelMetadataPresent: boolean;
 };
 
 export type SessionLoadResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  configOptionsPresent: boolean;
+  legacyModelMetadataPresent: boolean;
 };
 
-function toSessionLoadResult(response: LoadSessionResponse | undefined): SessionLoadResult {
+export type SessionResumeResult = SessionLoadResult;
+
+type ReconnectedSessionResponse = LoadSessionResponse | ResumeSessionResponse;
+
+function hasResponseField(response: unknown, field: string): boolean {
+  return !!response && typeof response === "object" && field in response;
+}
+
+function normalizeResponseConfigOptions(
+  response: { configOptions?: SessionConfigOption[] | null } | undefined,
+): SessionConfigOption[] | undefined {
+  if (!response || !("configOptions" in response)) {
+    return undefined;
+  }
+  return response.configOptions ?? [];
+}
+
+function toReconnectedSessionResult(
+  response: ReconnectedSessionResponse | undefined,
+): SessionLoadResult {
+  const configOptions = normalizeResponseConfigOptions(response);
   return {
     agentSessionId: extractRuntimeSessionId(response?._meta),
-    configOptions: response?.configOptions ?? undefined,
-    models: response?.models ?? undefined,
+    configOptions,
+    models: modelStateFromSessionResponse({ configOptions, response }),
+    configOptionsPresent: hasResponseField(response, "configOptions"),
+    legacyModelMetadataPresent: hasResponseField(response, "models"),
   };
 }
 
@@ -157,6 +245,7 @@ type AgentLaunchPlan = {
   spawnCommand: string;
   args: string[];
   resolvedBuiltInLaunch: ReturnType<typeof resolveBuiltInAgentLaunch>;
+  devinAcp: boolean;
   geminiAcp: boolean;
   copilotAcp: boolean;
   claudeAcp: boolean;
@@ -172,6 +261,10 @@ type SessionUpdateSuppressionState = {
   suppressSessionUpdates: boolean;
   suppressReplaySessionUpdateMessages: boolean;
 };
+
+type ModelControl = { kind: "config_option"; configId: string } | { kind: "legacy_set_model" };
+type ModelControlOverride = Pick<SessionModelState, "configId"> &
+  Partial<Pick<SessionModelState, "availableModels">>;
 
 export type AgentExitInfo = {
   exitCode: number | null;
@@ -237,11 +330,18 @@ function enqueueNdJsonLine(
     return;
   }
   try {
-    const message = JSON.parse(trimmedLine) as AnyMessage;
-    controller.enqueue(message);
+    const message = parseAcpJsonMessageLine(trimmedLine);
+    if (message) {
+      controller.enqueue(message);
+    }
   } catch (err) {
     console.error("Failed to parse JSON message:", trimmedLine, err);
   }
+}
+
+export function parseAcpJsonMessageLine(line: string): AnyMessage | undefined {
+  const message: unknown = JSON.parse(line);
+  return isAcpMessageObject(message) ? message : undefined;
 }
 
 function enqueueNdJsonLines(
@@ -344,6 +444,8 @@ export class AcpClient {
   private lastKnownPid?: number;
   private readonly promptPermissionFailures = new Map<string, PermissionPromptUnavailableError>();
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
+  private readonly modelConfigIds = new Map<string, string>();
+  private readonly legacyModelSessionIds = new Set<string>();
 
   constructor(options: AcpClientOptions) {
     this.options = {
@@ -404,8 +506,16 @@ export class AcpClient {
     return Boolean(this.initResult?.agentCapabilities?.loadSession);
   }
 
+  supportsResumeSession(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.resume);
+  }
+
   supportsCloseSession(): boolean {
     return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.close);
+  }
+
+  supportsListSessions(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.list);
   }
 
   setEventHandlers(
@@ -522,7 +632,7 @@ export class AcpClient {
       createNdJsonMessageStream(this.options.agentCommand, input, output),
     );
 
-    const connection = this.createConnection(stream);
+    const connection = this.createConnection(stream, launch);
     connection.signal.addEventListener(
       "abort",
       () => {
@@ -554,10 +664,15 @@ export class AcpClient {
       spawnCommand,
       args,
       resolvedBuiltInLaunch,
+      devinAcp: isDevinAcpCommand(spawnCommand, args),
       geminiAcp: isGeminiAcpCommand(spawnCommand, args),
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
-      spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials),
+      spawnOptions: buildAgentSpawnOptions(
+        this.options.cwd,
+        this.options.authCredentials,
+        this.options.sessionOptions?.env,
+      ),
     };
   }
 
@@ -608,10 +723,13 @@ export class AcpClient {
     return requireAgentStdio(spawnedChild);
   }
 
-  private createConnection(stream: {
-    readable: ReadableStream<AnyMessage>;
-    writable: WritableStream<AnyMessage>;
-  }): ClientSideConnection {
+  private createConnection(
+    stream: {
+      readable: ReadableStream<AnyMessage>;
+      writable: WritableStream<AnyMessage>;
+    },
+    launch: Pick<AgentLaunchPlan, "devinAcp">,
+  ): ClientSideConnection {
     return new ClientSideConnection(
       () => ({
         sessionUpdate: async (params: SessionNotification) => {
@@ -621,6 +739,16 @@ export class AcpClient {
           params: RequestPermissionRequest,
         ): Promise<RequestPermissionResponse> => {
           return this.handlePermissionRequest(params);
+        },
+        extMethod: async (method: string): Promise<Record<string, unknown>> => {
+          if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
+            return {};
+          }
+          const error = RequestError.methodNotFound(method);
+          if (!this.options.suppressSdkConsoleErrors) {
+            console.error(error.message);
+          }
+          throw error;
         },
         readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
           return this.handleReadTextFile(params);
@@ -647,6 +775,7 @@ export class AcpClient {
         ): Promise<ReleaseTerminalResponse> => {
           return this.handleReleaseTerminal(params);
         },
+        extNotification: async (): Promise<void> => {},
       }),
       stream,
     );
@@ -661,7 +790,7 @@ export class AcpClient {
   }): Promise<void> {
     try {
       const initResult = await Promise.race([
-        this.initializeProtocolConnection(params.connection, params.launch.geminiAcp),
+        this.initializeProtocolConnection(params.connection, params.launch),
         params.startupFailure.promise,
       ]);
       params.startupFailure.dispose();
@@ -676,23 +805,17 @@ export class AcpClient {
 
   private async initializeProtocolConnection(
     connection: ClientSideConnection,
-    geminiAcp: boolean,
+    launch: Pick<AgentLaunchPlan, "devinAcp" | "geminiAcp">,
   ): Promise<InitializeResponse> {
     const initializePromise = connection.initialize({
       protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
+      clientCapabilities: resolveClientCapabilities({
+        devinAcp: launch.devinAcp,
         terminal: this.options.terminal !== false,
-      },
-      clientInfo: {
-        name: "acpx",
-        version: "0.1.0",
-      },
+      }),
+      clientInfo: resolveClientInfo(launch.devinAcp),
     });
-    const initialized = geminiAcp
+    const initialized = launch.geminiAcp
       ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
       : await initializePromise;
     await this.authenticateIfRequired(connection, initialized.authMethods ?? []);
@@ -798,7 +921,7 @@ export class AcpClient {
         connection.newSession({
           cwd: sessionCwd,
           mcpServers: this.options.mcpServers ?? [],
-          _meta: buildClaudeCodeOptionsMeta(this.options.sessionOptions),
+          _meta: buildClaudeCodeOptionsMeta(this.options.sessionOptions, claudeAcp),
         }),
       );
       result = claudeAcp
@@ -815,12 +938,17 @@ export class AcpClient {
     }
 
     this.loadedSessionId = result.sessionId;
+    const configOptions = normalizeResponseConfigOptions(result);
+    const models = modelStateFromSessionResponse({ configOptions, response: result });
+    this.rememberSessionModels(result.sessionId, models);
 
     return {
       sessionId: result.sessionId,
       agentSessionId: extractRuntimeSessionId(result._meta),
-      configOptions: result.configOptions ?? undefined,
-      models: result.models ?? undefined,
+      configOptions,
+      models,
+      configOptionsPresent: hasResponseField(result, "configOptions"),
+      legacyModelMetadataPresent: hasResponseField(result, "models"),
     };
   }
 
@@ -860,8 +988,26 @@ export class AcpClient {
     }
 
     this.loadedSessionId = sessionId;
+    const result = toReconnectedSessionResult(response);
+    this.updateRememberedSessionModels(sessionId, result);
+    return result;
+  }
 
-    return toSessionLoadResult(response);
+  async resumeSession(sessionId: string, cwd = this.options.cwd): Promise<SessionResumeResult> {
+    const connection = this.getConnection();
+    const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const response = await this.runConnectionRequest(() =>
+      connection.resumeSession({
+        sessionId,
+        cwd: sessionCwd,
+        mcpServers: this.options.mcpServers ?? [],
+      }),
+    );
+
+    this.loadedSessionId = sessionId;
+    const result = toReconnectedSessionResult(response);
+    this.updateRememberedSessionModels(sessionId, result);
+    return result;
   }
 
   private applySessionUpdateSuppression(enabled: boolean): SessionUpdateSuppressionState {
@@ -882,6 +1028,7 @@ export class AcpClient {
 
   async prompt(sessionId: string, prompt: PromptInput | string): Promise<PromptResponse> {
     const connection = this.getConnection();
+    const normalizedPrompt = this.normalizePromptForAgent(prompt);
     const restoreConsoleError = this.options.suppressSdkConsoleErrors
       ? installSdkConsoleErrorSuppression()
       : undefined;
@@ -891,7 +1038,7 @@ export class AcpClient {
       promptPromise = this.runConnectionRequest(() =>
         connection.prompt({
           sessionId,
-          prompt: typeof prompt === "string" ? textPrompt(prompt) : prompt,
+          prompt: normalizedPrompt,
         }),
       );
     } catch (error) {
@@ -918,6 +1065,18 @@ export class AcpClient {
       this.abortAndDropPermissionSignal(sessionId);
       this.promptPermissionFailures.delete(sessionId);
     }
+  }
+
+  private normalizePromptForAgent(prompt: PromptInput | string): PromptInput {
+    const normalizedPrompt = typeof prompt === "string" ? textPrompt(prompt) : prompt;
+    const unsupportedPromptContent = getUnsupportedPromptContentMessage(
+      normalizedPrompt,
+      this.initResult?.agentCapabilities,
+    );
+    if (unsupportedPromptContent) {
+      throw new UnsupportedPromptContentError(unsupportedPromptContent);
+    }
+    return normalizedPrompt;
   }
 
   private returnPromptResponseOrPermissionFailure(
@@ -972,38 +1131,121 @@ export class AcpClient {
     }
   }
 
-  async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+  async setSessionModel(
+    sessionId: string,
+    modelId: string,
+    controlOverride?: ModelControlOverride,
+  ): Promise<SetSessionConfigOptionResponse | undefined> {
+    const control = this.resolveModelControl(sessionId, controlOverride);
+    if (!control) {
+      throw new RequestedModelUnsupportedError(
+        `Cannot set model "${modelId}": the ACP session did not advertise a model config option or legacy session/set_model support.`,
+        "missing-capability",
+      );
+    }
+    const resolvedModelId = resolveRequestedModelId({
+      requestedModel: modelId,
+      models: controlOverride?.availableModels
+        ? { availableModels: controlOverride.availableModels }
+        : undefined,
+      agentCommand: this.options.agentCommand,
+    });
+    return control.kind === "config_option"
+      ? await this.setSessionModelThroughConfig(sessionId, resolvedModelId, control.configId)
+      : await this.setSessionModelThroughLegacyMethod(sessionId, resolvedModelId);
+  }
+
+  private async setSessionModelThroughConfig(
+    sessionId: string,
+    modelId: string,
+    configId: string,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const connection = this.getConnection();
+    try {
+      const response = await this.runConnectionRequest(() =>
+        connection.setSessionConfigOption({
+          sessionId,
+          configId,
+          value: modelId,
+        }),
+      );
+      this.rememberSessionModels(sessionId, modelStateFromConfigOptions(response.configOptions));
+      return response;
+    } catch (error) {
+      return this.throwSessionModelError("session/set_config_option", modelId, error);
+    }
+  }
+
+  private async setSessionModelThroughLegacyMethod(
+    sessionId: string,
+    modelId: string,
+  ): Promise<undefined> {
     const connection = this.getConnection();
     try {
       await this.runConnectionRequest(() =>
-        connection.unstable_setSessionModel({
-          sessionId,
-          modelId,
-        }),
+        connection.extMethod("session/set_model", { sessionId, modelId }),
       );
+      return undefined;
     } catch (error) {
-      const wrapped = maybeWrapSessionControlError(
-        "session/set_model",
-        error,
-        `for model "${modelId}"`,
-      );
-      if (wrapped !== error) {
-        throw wrapped;
-      }
-      const acp = extractAcpError(error);
-      const summary = acp
-        ? formatSessionControlAcpSummary(acp)
-        : error instanceof Error
-          ? error.message
-          : String(error);
-      if (error instanceof Error) {
-        throw new Error(`Failed session/set_model for model "${modelId}": ${summary}`, {
-          cause: error,
-        });
-      }
-      throw new Error(`Failed session/set_model for model "${modelId}": ${summary}`, {
-        cause: error,
-      });
+      return this.throwSessionModelError("session/set_model", modelId, error);
+    }
+  }
+
+  private throwSessionModelError(
+    method: "session/set_model" | "session/set_config_option",
+    modelId: string,
+    error: unknown,
+  ): never {
+    const wrapped = maybeWrapSessionControlError(method, error, `for model "${modelId}"`);
+    if (wrapped !== error) {
+      throw wrapped;
+    }
+    const acp = extractAcpError(error);
+    const summary = acp
+      ? formatSessionControlAcpSummary(acp)
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    throw new Error(`Failed ${method} for model "${modelId}": ${summary}`, {
+      cause: error,
+    });
+  }
+
+  private resolveModelControl(
+    sessionId: string,
+    controlOverride: ModelControlOverride | undefined,
+  ): ModelControl | undefined {
+    if (controlOverride) {
+      return controlOverride.configId
+        ? { kind: "config_option", configId: controlOverride.configId }
+        : { kind: "legacy_set_model" };
+    }
+    const configId = this.modelConfigIds.get(sessionId);
+    if (configId) {
+      return { kind: "config_option", configId };
+    }
+    return this.legacyModelSessionIds.has(sessionId) ? { kind: "legacy_set_model" } : undefined;
+  }
+
+  private rememberSessionModels(sessionId: string, models: SessionModelState | undefined): void {
+    if (!models) {
+      this.modelConfigIds.delete(sessionId);
+      this.legacyModelSessionIds.delete(sessionId);
+      return;
+    }
+    if (models.configId) {
+      this.modelConfigIds.set(sessionId, models.configId);
+      this.legacyModelSessionIds.delete(sessionId);
+      return;
+    }
+    this.modelConfigIds.delete(sessionId);
+    this.legacyModelSessionIds.add(sessionId);
+  }
+
+  private updateRememberedSessionModels(sessionId: string, result: SessionLoadResult): void {
+    const explicitConfigRemoval = result.configOptionsPresent && this.modelConfigIds.has(sessionId);
+    if (result.models || result.legacyModelMetadataPresent || explicitConfigRemoval) {
+      this.rememberSessionModels(sessionId, result.models);
     }
   }
 
@@ -1028,6 +1270,13 @@ export class AcpClient {
     if (this.loadedSessionId === sessionId) {
       this.loadedSessionId = undefined;
     }
+    this.modelConfigIds.delete(sessionId);
+    this.legacyModelSessionIds.delete(sessionId);
+  }
+
+  async listSessions(params: ListSessionsRequest = {}): Promise<ListSessionsResponse> {
+    const connection = this.getConnection();
+    return await this.runConnectionRequest(() => connection.listSessions(params));
   }
 
   async requestCancelActivePrompt(): Promise<boolean> {
@@ -1115,6 +1364,8 @@ export class AcpClient {
     this.permissionAbortControllers.clear();
     this.promptPermissionFailures.clear();
     this.loadedSessionId = undefined;
+    this.modelConfigIds.clear();
+    this.legacyModelSessionIds.clear();
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;

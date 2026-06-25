@@ -291,6 +291,18 @@ test("text remediation hints cover missing session and ACP runtime failures", ()
     }),
     ["hint: rerun with `--verbose` to capture the ACP method/error details before retrying."],
   );
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "RUNTIME",
+      message: "Failed session/set_model for model legacy-model: Invalid params",
+      origin: "acp",
+      acp: {
+        code: -32602,
+        message: "Invalid params",
+      },
+    }),
+    ["hint: rerun with `--verbose` to capture the ACP method/error details before retrying."],
+  );
 });
 
 test("text formatter suppresses read output when requested", () => {
@@ -378,6 +390,54 @@ test("json formatter suppresses read output when requested", () => {
   assert.equal(
     (lines[1]?.result as { content?: string } | undefined)?.content,
     "[read output suppressed]",
+  );
+});
+
+test("json formatter clears suppressed read tracking after error responses", () => {
+  const writer = new CaptureWriter();
+  const formatter = createOutputFormatter("json", {
+    stdout: writer,
+    suppressReads: true,
+    jsonContext: {
+      sessionId: "session-json",
+    },
+  });
+
+  formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    id: "req-read-error",
+    method: "fs/read_text_file",
+    params: {
+      sessionId: "session-json",
+      path: "/tmp/demo.txt",
+    },
+  } as never);
+  formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    id: "req-read-error",
+    error: {
+      code: -32000,
+      message: "failed",
+    },
+  } as never);
+  formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    id: "req-read-error",
+    result: {
+      content: "visible later response",
+    },
+  } as never);
+
+  const lines = writer
+    .toString()
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  assert.equal(
+    (lines[2]?.result as { content?: string } | undefined)?.content,
+    "visible later response",
   );
 });
 

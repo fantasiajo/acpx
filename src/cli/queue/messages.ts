@@ -132,6 +132,7 @@ export type QueueOwnerSetModelResultMessage = {
   requestId: string;
   ownerGeneration?: number;
   modelId: string;
+  response?: SetSessionConfigOptionResponse;
 };
 
 export type QueueOwnerSetConfigOptionResultMessage = {
@@ -281,6 +282,9 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   if (!assignSessionSystemPrompt(sessionOptions, record.systemPrompt)) {
     return null;
   }
+  if (!assignSessionEnv(sessionOptions, record.env)) {
+    return null;
+  }
 
   return sessionOptions;
 }
@@ -331,6 +335,22 @@ function assignSessionSystemPrompt(options: QueueSessionOptions, value: unknown)
     return false;
   }
   options.systemPrompt = { append: systemPrompt.append };
+  return true;
+}
+
+function assignSessionEnv(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  const env = asRecord(value);
+  if (!env) {
+    return false;
+  }
+  const entries = Object.entries(env);
+  if (entries.some(([, entryValue]) => typeof entryValue !== "string")) {
+    return false;
+  }
+  options.env = Object.fromEntries(entries) as Record<string, string>;
   return true;
 }
 
@@ -650,8 +670,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
     parseBooleanResultOwnerMessage(message, context, "close_session_result", "closed"),
   set_mode_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_mode_result", "modeId"),
-  set_model_result: (message, context) =>
-    parseStringResultOwnerMessage(message, context, "set_model_result", "modelId"),
+  set_model_result: parseSetModelOwnerMessage,
   set_config_option_result: parseSetConfigOptionOwnerMessage,
   error: parseErrorOwnerMessage,
 };
@@ -721,6 +740,25 @@ function parseStringResultOwnerMessage<TType extends "set_mode_result" | "set_mo
     QueueOwnerMessage,
     { type: TType }
   >;
+}
+
+function parseSetModelOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerSetModelResultMessage | null {
+  if (typeof message.modelId !== "string") {
+    return null;
+  }
+  const response = asRecord(message.response);
+  if (message.response !== undefined && (!response || !Array.isArray(response.configOptions))) {
+    return null;
+  }
+  return {
+    type: "set_model_result",
+    ...context,
+    modelId: message.modelId,
+    ...(response ? { response: response as SetSessionConfigOptionResponse } : {}),
+  };
 }
 
 function parseSetConfigOptionOwnerMessage(

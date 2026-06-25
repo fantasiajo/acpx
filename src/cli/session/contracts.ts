@@ -13,6 +13,7 @@ import type {
   PermissionMode,
   PermissionPolicy,
   PromptInput,
+  AgentSessionListResult,
   SessionNotification,
   SessionResumePolicy,
   SessionRecord,
@@ -73,6 +74,7 @@ export type SessionCreateOptions = {
   terminal?: boolean;
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
+  onModelWarning?: (message: string) => void;
 } & TimedRunOptions;
 
 export type SessionSendOptions = {
@@ -80,6 +82,8 @@ export type SessionSendOptions = {
   prompt: PromptInput;
   resumePolicy?: SessionResumePolicy;
   mcpServers?: McpServer[];
+  mcpConfigPath?: string;
+  mcpConfigFingerprint?: string;
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
@@ -117,7 +121,25 @@ export type SessionEnsureOptions = {
   verbose?: boolean;
   walkBoundary?: string;
   sessionOptions?: SessionAgentOptions;
+  onModelWarning?: (message: string) => void;
 } & TimedRunOptions;
+
+export type SessionListOptions = {
+  agentCommand: string;
+  cwd: string;
+  cursor?: string;
+  filterCwd?: string;
+  mcpServers?: McpServer[];
+  permissionMode: PermissionMode;
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
+  authCredentials?: Record<string, string>;
+  authPolicy?: AuthPolicy;
+  terminal?: boolean;
+  verbose?: boolean;
+} & TimedRunOptions;
+
+export type SessionListResult = AgentSessionListResult | undefined;
 
 export type SessionCancelOptions = {
   sessionId: string;

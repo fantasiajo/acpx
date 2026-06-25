@@ -17,6 +17,7 @@ import type {
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
+  ensureOwnerIsUsable,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
@@ -293,6 +294,8 @@ export type SubmitToQueueOwnerOptions = {
   sessionId: string;
   message: string;
   prompt?: PromptInput;
+  mcpConfigPath?: string;
+  mcpConfigFingerprint?: string;
   permissionMode: PermissionMode;
   resumePolicy?: SessionResumePolicy;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
@@ -572,7 +575,7 @@ async function submitSetModelToQueueOwner(
   owner: QueueOwnerRecord,
   modelId: string,
   timeoutMs?: number,
-): Promise<boolean | undefined> {
+): Promise<QueueOwnerSetModelResultMessage | undefined> {
   const request: QueueSetModelRequest = {
     type: "set_model",
     requestId: randomUUID(),
@@ -595,7 +598,7 @@ async function submitSetModelToQueueOwner(
       retryable: true,
     });
   }
-  return true;
+  return response;
 }
 
 async function submitSetConfigOptionToQueueOwner(
@@ -660,6 +663,33 @@ async function submitCloseSessionToQueueOwner(
   return response.closed;
 }
 
+function queueOwnerMcpConfigMatches(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): boolean {
+  return (
+    owner.mcpConfigPath === options.mcpConfigPath &&
+    owner.mcpConfigFingerprint === options.mcpConfigFingerprint
+  );
+}
+
+function assertQueueOwnerMcpConfigMatches(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  if (queueOwnerMcpConfigMatches(owner, options)) {
+    return;
+  }
+  throw new QueueConnectionError(
+    "Session queue owner uses a different MCP config; close the session before retrying",
+    {
+      detailCode: "QUEUE_MCP_CONFIG_CONFLICT",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
@@ -667,6 +697,10 @@ export async function trySubmitToRunningOwner(
   if (!owner) {
     return undefined;
   }
+  if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
+    return undefined;
+  }
+  assertQueueOwnerMcpConfigMatches(owner, options);
 
   let submitted: SessionSendOutcome | undefined;
   try {
@@ -817,7 +851,7 @@ export async function trySetModelOnRunningOwner(
   modelId: string,
   timeoutMs: number | undefined,
   verbose: boolean | undefined,
-): Promise<boolean | undefined> {
+): Promise<QueueOwnerSetModelResultMessage | undefined> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
     return undefined;
@@ -827,10 +861,10 @@ export async function trySetModelOnRunningOwner(
   if (submitted) {
     if (verbose) {
       process.stderr.write(
-        `[acpx] requested session/set_model on owner pid ${owner.pid} for session ${sessionId}\n`,
+        `[acpx] requested a model config update on owner pid ${owner.pid} for session ${sessionId}\n`,
       );
     }
-    return true;
+    return submitted;
   }
 
   const health = await probeQueueOwnerHealth(sessionId);

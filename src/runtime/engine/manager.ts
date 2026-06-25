@@ -3,9 +3,13 @@ import path from "node:path";
 import { AcpClient } from "../../acp/client.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
+import { modelStateFromConfigOptions } from "../../acp/model-support.js";
 import { withTimeout } from "../../async-control.js";
 import { textPrompt, type PromptInput } from "../../prompt-content.js";
-import { applyConfigOptionsToRecord } from "../../session/config-options.js";
+import {
+  applyConfigOptionsToRecord,
+  applyConfigOptionsToState,
+} from "../../session/config-options.js";
 import {
   cloneSessionAcpxState,
   cloneSessionConversation,
@@ -18,23 +22,37 @@ import {
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
+  clearDesiredConfigOption,
   setCurrentModelId,
   setDesiredConfigOption,
+  setDesiredModelId,
   setDesiredModeId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
-import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
-import type { ClientOperation, SessionRecord, SessionResumePolicy } from "../../types.js";
+import {
+  applyRequestedModelIfAdvertised,
+  currentModelIdFromSetModelResponse,
+} from "../../session/model-application.js";
+import { advertisedModelState } from "../../session/model-state.js";
 import type {
+  ClientOperation,
+  SessionRecord,
+  SessionResumePolicy,
+  SessionTokenUsage,
+} from "../../types.js";
+import type {
+  AcpRuntimeAvailableCommand,
   AcpRuntimeEvent,
   AcpRuntimeHandle,
   AcpRuntimeOptions,
   AcpRuntimePromptMode,
   AcpRuntimeSessionModels,
+  AcpRuntimeSessionUsage,
   AcpRuntimeStatus,
   AcpRuntimeTurnAttachment,
   AcpRuntimeTurn,
   AcpRuntimeTurnResult,
+  AcpRuntimeUsageBreakdown,
 } from "../public/contract.js";
 import { AcpRuntimeError } from "../public/errors.js";
 import { parsePromptEventLine } from "../public/events.js";
@@ -47,7 +65,11 @@ import {
 import { runPromptTurn } from "./prompt-turn.js";
 import { connectAndLoadSession, type ConnectAndLoadSessionResult } from "./reconnect.js";
 import { shouldReuseExistingRecord } from "./reuse-policy.js";
-import { persistSessionOptions, type SessionAgentOptions } from "./session-options.js";
+import {
+  persistSessionOptions,
+  sessionOptionsFromRecord,
+  type SessionAgentOptions,
+} from "./session-options.js";
 
 export type AcpRuntimeManagerDeps = {
   clientFactory?: (options: ConstructorParameters<typeof AcpClient>[0]) => AcpClient;
@@ -57,7 +79,7 @@ type ActiveSessionController = {
   hasActivePrompt: () => boolean;
   requestCancelActivePrompt: () => Promise<boolean>;
   setSessionMode: (modeId: string) => Promise<void>;
-  setSessionModel: (modelId: string) => Promise<void>;
+  setSessionModel: (modelId: string) => ReturnType<AcpClient["setSessionModel"]>;
   setSessionConfigOption: (
     configId: string,
     value: string,
@@ -167,24 +189,31 @@ function toPromptInput(
   if (!attachments || attachments.length === 0) {
     return text;
   }
-  const blocks: Array<
-    { type: "text"; text: string } | { type: "image"; mimeType: string; data: string }
-  > = [];
+  const blocks: PromptInput = [];
   if (text) {
     blocks.push({ type: "text", text });
   }
   for (const attachment of attachments) {
-    if (!attachment.mediaType.startsWith("image/")) {
-      throw new AcpRuntimeError(
-        "ACP_TURN_FAILED",
-        `Unsupported ACP runtime attachment media type: ${attachment.mediaType}`,
-      );
+    if (attachment.mediaType.startsWith("image/")) {
+      blocks.push({
+        type: "image",
+        mimeType: attachment.mediaType,
+        data: attachment.data,
+      });
+      continue;
     }
-    blocks.push({
-      type: "image",
-      mimeType: attachment.mediaType,
-      data: attachment.data,
-    });
+    if (attachment.mediaType.startsWith("audio/")) {
+      blocks.push({
+        type: "audio",
+        mimeType: attachment.mediaType,
+        data: attachment.data,
+      });
+      continue;
+    }
+    throw new AcpRuntimeError(
+      "ACP_TURN_FAILED",
+      `Unsupported ACP runtime attachment media type: ${attachment.mediaType}`,
+    );
   }
   return blocks.length > 0 ? blocks : textPrompt(text);
 }
@@ -271,6 +300,104 @@ function buildModelsField(record: SessionRecord): { models?: AcpRuntimeSessionMo
   };
 }
 
+function tokenUsageToBreakdown(
+  usage: SessionTokenUsage | undefined,
+): AcpRuntimeUsageBreakdown | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  const breakdown: AcpRuntimeUsageBreakdown = {};
+  assignUsageBreakdownField(breakdown, "inputTokens", usage.input_tokens);
+  assignUsageBreakdownField(breakdown, "outputTokens", usage.output_tokens);
+  assignUsageBreakdownField(breakdown, "cachedReadTokens", usage.cache_read_input_tokens);
+  assignUsageBreakdownField(breakdown, "cachedWriteTokens", usage.cache_creation_input_tokens);
+  assignUsageBreakdownField(breakdown, "thoughtTokens", usage.thought_tokens);
+  assignUsageBreakdownField(breakdown, "totalTokens", usage.total_tokens);
+  return Object.keys(breakdown).length > 0 ? breakdown : undefined;
+}
+
+function assignUsageBreakdownField(
+  breakdown: AcpRuntimeUsageBreakdown,
+  key: keyof AcpRuntimeUsageBreakdown,
+  value: number | undefined,
+): void {
+  if (value !== undefined) {
+    breakdown[key] = value;
+  }
+}
+
+function buildUsageField(record: SessionRecord): { usage?: AcpRuntimeSessionUsage } {
+  const cumulative = tokenUsageToBreakdown(record.cumulative_token_usage);
+  const perRequestEntries = Object.entries(record.request_token_usage ?? {})
+    .map(([id, value]) => [id, tokenUsageToBreakdown(value)] as const)
+    .filter(
+      (entry): entry is readonly [string, AcpRuntimeUsageBreakdown] => entry[1] !== undefined,
+    );
+  const perRequest =
+    perRequestEntries.length > 0 ? Object.fromEntries(perRequestEntries) : undefined;
+  const cost = record.cumulative_cost;
+  const usage: AcpRuntimeSessionUsage = {
+    ...(cumulative ? { cumulative } : {}),
+    ...(cost ? { cost } : {}),
+    ...(perRequest ? { perRequest } : {}),
+  };
+  return Object.keys(usage).length > 0 ? { usage } : {};
+}
+
+function buildAvailableCommandsField(record: SessionRecord): {
+  availableCommands?: AcpRuntimeAvailableCommand[];
+} {
+  const commands = record.acpx?.available_commands as readonly unknown[] | undefined;
+  if (!commands || commands.length === 0) {
+    return {};
+  }
+  const availableCommands = commands
+    .map((command) => runtimeAvailableCommand(command))
+    .filter((command): command is AcpRuntimeAvailableCommand => command !== undefined);
+  return availableCommands.length > 0 ? { availableCommands } : {};
+}
+
+function runtimeAvailableCommand(command: unknown): AcpRuntimeAvailableCommand | undefined {
+  if (typeof command === "string") {
+    const name = command.trim();
+    return name ? { name } : undefined;
+  }
+  const record = commandRecord(command);
+  if (!record) {
+    return undefined;
+  }
+  const name = trimmedField(record.name);
+  if (!name) {
+    return undefined;
+  }
+  const runtimeCommand: AcpRuntimeAvailableCommand = { name };
+  const description = trimmedField(record.description);
+  if (description) {
+    runtimeCommand.description = description;
+  }
+  if (typeof record.has_input === "boolean") {
+    runtimeCommand.hasInput = record.has_input;
+  }
+  return runtimeCommand;
+}
+
+function commandRecord(
+  value: unknown,
+): { name?: unknown; description?: unknown; has_input?: unknown } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as { name?: unknown; description?: unknown; has_input?: unknown };
+}
+
+function trimmedField(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function advertisedConfigOptionIds(record: SessionRecord): Set<string> | undefined {
   const configOptions = record.acpx?.config_options;
   if (!configOptions) {
@@ -350,12 +477,73 @@ type RunningRuntimeTurn = {
   activeSessionId: string;
 };
 
+function applyConfigOptionResponseToTurn(
+  turn: RunningRuntimeTurn,
+  response:
+    | Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>
+    | Awaited<ReturnType<AcpClient["setSessionModel"]>>,
+): void {
+  if (!response?.configOptions) {
+    return;
+  }
+  turn.acpxState = applyConfigOptionsToState(turn.acpxState, response.configOptions);
+}
+
+function applyDesiredConfigOptionToTurn(
+  turn: RunningRuntimeTurn,
+  configId: string,
+  value: string,
+): void {
+  const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
+  const modelConfigId = modelStateFromConfigOptions(nextState.config_options)?.configId;
+  if (configId === modelConfigId) {
+    nextState.session_options = { ...nextState.session_options, model: value };
+    clearDesiredConfigOption(nextState, configId);
+  } else if (configId === "mode") {
+    nextState.desired_mode_id = value;
+  } else {
+    nextState.desired_config_options = {
+      ...nextState.desired_config_options,
+      [configId]: value,
+    };
+  }
+  turn.acpxState = nextState;
+}
+
+function applyDesiredConfigOptionToRecord(
+  record: SessionRecord,
+  configId: string,
+  value: string,
+): void {
+  const modelConfigId = modelStateFromConfigOptions(record.acpx?.config_options)?.configId;
+  if (configId === modelConfigId) {
+    setDesiredModelId(record, value, configId);
+  } else if (configId === "mode") {
+    setDesiredModeId(record, value);
+  } else {
+    setDesiredConfigOption(record, configId, value);
+  }
+}
+
 async function createOrLoadRuntimeSession(
   client: AcpClient,
   resumeSessionId: string | undefined,
   cwd: string,
 ): Promise<CreatedRuntimeSession> {
   if (resumeSessionId) {
+    if (client.supportsResumeSession()) {
+      const resumed = await client.resumeSession(resumeSessionId, cwd);
+      return {
+        sessionId: resumeSessionId,
+        agentSessionId: resumed.agentSessionId,
+        sessionResult: resumed,
+      };
+    }
+    if (!client.supportsLoadSession()) {
+      throw new Error(
+        `Agent does not support session/resume or session/load; cannot resume session ${resumeSessionId}`,
+      );
+    }
     const loaded = await client.loadSession(resumeSessionId, cwd);
     return {
       sessionId: resumeSessionId,
@@ -572,7 +760,7 @@ export class AcpRuntimeManager {
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConfigOptionsToRecord(record, session.sessionResult);
-    const requestedModelApplied = await applyRequestedModelIfAdvertised({
+    const modelApplication = await applyRequestedModelIfAdvertised({
       client,
       sessionId: session.sessionId,
       requestedModel: input.sessionOptions?.model,
@@ -580,9 +768,18 @@ export class AcpRuntimeManager {
       agentCommand,
       timeoutMs: this.options.timeoutMs,
     });
-    syncAdvertisedModelState(record, session.sessionResult.models);
-    if (requestedModelApplied) {
-      setCurrentModelId(record, input.sessionOptions?.model);
+    applyConfigOptionsToRecord(record, modelApplication.response);
+    syncAdvertisedModelState(
+      record,
+      modelApplication.response
+        ? modelStateFromConfigOptions(modelApplication.response.configOptions)
+        : session.sessionResult.models,
+    );
+    if (modelApplication.applied) {
+      setCurrentModelId(
+        record,
+        currentModelIdFromSetModelResponse(modelApplication.response, input.sessionOptions?.model),
+      );
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     persistSessionOptions(record, input.sessionOptions);
@@ -771,6 +968,7 @@ export class AcpRuntimeManager {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
       verbose: this.options.verbose,
+      sessionOptions: sessionOptionsFromRecord(record),
     });
   }
 
@@ -806,7 +1004,15 @@ export class AcpRuntimeManager {
       },
       setSessionModel: async (modelId: string) => {
         await this.waitForRuntimeControlSession(task, turn);
-        await turn.client.setSessionModel(turn.activeSessionId, modelId);
+        const models = advertisedModelState(turn.acpxState);
+        const response = await turn.client.setSessionModel(turn.activeSessionId, modelId, models);
+        applyConfigOptionResponseToTurn(turn, response);
+        const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
+        nextState.session_options = { ...nextState.session_options, model: modelId };
+        nextState.current_model_id = currentModelIdFromSetModelResponse(response, modelId);
+        clearDesiredConfigOption(nextState, models?.configId);
+        turn.acpxState = nextState;
+        return response;
       },
       setSessionConfigOption: async (configId: string, value: string) => {
         const result = await task.state.activeController!.setResolvedSessionConfigOption(
@@ -876,25 +1082,8 @@ export class AcpRuntimeManager {
     value: string,
     response: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>,
   ): void {
-    if (response?.configOptions) {
-      const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
-      nextState.config_options = structuredClone(response.configOptions);
-      turn.acpxState = nextState;
-    }
-    if (configId === "mode") {
-      const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
-      nextState.desired_mode_id = value;
-      turn.acpxState = nextState;
-      return;
-    }
-    if (configId !== "model") {
-      const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
-      nextState.desired_config_options = {
-        ...nextState.desired_config_options,
-        [configId]: value,
-      };
-      turn.acpxState = nextState;
-    }
+    applyConfigOptionResponseToTurn(turn, response);
+    applyDesiredConfigOptionToTurn(turn, configId, value);
   }
 
   private installRuntimeTurnEventHandlers(task: RuntimeTurnTask, turn: RunningRuntimeTurn): void {
@@ -993,7 +1182,7 @@ export class AcpRuntimeManager {
     }
     this.emitRuntimeTurnEvent(task, {
       type: "status",
-      text: loadError ? `load fallback: ${loadError}` : "session resumed",
+      text: loadError ? `session reconnect fallback: ${loadError}` : "session resumed",
     });
   }
 
@@ -1109,6 +1298,8 @@ export class AcpRuntimeManager {
       backendSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
       ...buildModelsField(record),
+      ...buildUsageField(record),
+      ...buildAvailableCommandsField(record),
       details: {
         cwd: record.cwd,
         lastUsedAt: record.lastUsedAt,
@@ -1155,11 +1346,7 @@ export class AcpRuntimeManager {
     if (controller) {
       const { configId, response } = await controller.setResolvedSessionConfigOption(key, value);
       applyConfigOptionsToRecord(record, response);
-      if (configId === "mode") {
-        setDesiredModeId(record, value);
-      } else {
-        setDesiredConfigOption(record, configId, value);
-      }
+      applyDesiredConfigOptionToRecord(record, configId, value);
       await this.options.sessionStore.save(record);
       return;
     }
@@ -1171,11 +1358,7 @@ export class AcpRuntimeManager {
         const configId = resolveSupportedConfigOptionId(connectedRecord, key);
         const response = await client.setSessionConfigOption(sessionId, configId, value);
         applyConfigOptionsToRecord(connectedRecord, response);
-        if (configId === "mode") {
-          setDesiredModeId(connectedRecord, value);
-        } else {
-          setDesiredConfigOption(connectedRecord, configId, value);
-        }
+        applyDesiredConfigOptionToRecord(connectedRecord, configId, value);
       },
     );
     await this.options.sessionStore.save(result.record);

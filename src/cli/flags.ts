@@ -68,7 +68,27 @@ export type SessionsHistoryFlags = {
   limit: number;
 };
 
+export type SessionsListFlags = {
+  cursor?: string;
+  filterCwd?: string;
+  local?: boolean;
+};
+
+export type SessionsExportFlags = {
+  output: string;
+  sourceCwd?: string;
+};
+
+export type SessionsImportFlags = {
+  name?: string;
+  destinationCwd?: string;
+};
+
 export type StatusFlags = {
+  session?: string;
+};
+
+type SessionSelectionFlags = {
   session?: string;
 };
 
@@ -321,6 +341,10 @@ export function addGlobalFlags(command: Command): Command {
       "Queue owner idle TTL before shutdown (0 = keep alive forever) (default: 300)",
       parseTtlSeconds,
     )
+    .option(
+      "--mcp-config <path>",
+      "Load MCP servers from a JSON config file instead of project/global mcpServers",
+    )
     .option("--verbose", "Enable verbose debug logs");
 }
 
@@ -342,7 +366,7 @@ export function addSessionNameOption(command: Command): Command {
 }
 
 export function resolveSessionNameFromFlags(
-  flags: StatusFlags,
+  flags: SessionSelectionFlags,
   command: Command,
 ): string | undefined {
   const directSession = parseOptionalSessionName(flags.session);

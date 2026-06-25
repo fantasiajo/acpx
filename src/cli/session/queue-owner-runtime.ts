@@ -52,6 +52,8 @@ async function submitToRunningOwner(
     sessionId: options.sessionId,
     message: promptToDisplayText(options.prompt),
     prompt: options.prompt,
+    mcpConfigPath: options.mcpConfigPath,
+    mcpConfigFingerprint: options.mcpConfigFingerprint,
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
     permissionPolicy: options.permissionPolicy,
@@ -107,7 +109,7 @@ function createQueueOwnerTurnController(
       });
     },
     setSessionModelFallback: async (modelId: string, timeoutMs?: number) => {
-      await runSessionSetModelDirect({
+      const result = await runSessionSetModelDirect({
         sessionRecordId: options.sessionId,
         modelId,
         mcpServers: options.mcpServers,
@@ -118,6 +120,7 @@ function createQueueOwnerTurnController(
         timeoutMs,
         verbose: options.verbose,
       });
+      return result.response;
     },
     setSessionConfigOptionFallback: async (configId: string, value: string, timeoutMs?: number) => {
       const result = await runSessionSetConfigOptionDirect({
@@ -196,7 +199,10 @@ async function writeQueueOwnerLifecycleSnapshot(
 }
 
 export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
-  const lease = await tryAcquireQueueOwnerLease(options.sessionId);
+  const lease = await tryAcquireQueueOwnerLease(options.sessionId, {
+    path: options.mcpConfigPath,
+    fingerprint: options.mcpConfigFingerprint,
+  });
   if (!lease) {
     return;
   }
@@ -265,9 +271,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         setSessionMode: async (modeId: string, timeoutMs?: number) => {
           await turnController.setSessionMode(modeId, timeoutMs);
         },
-        setSessionModel: async (modelId: string, timeoutMs?: number) => {
-          await turnController.setSessionModel(modelId, timeoutMs);
-        },
+        setSessionModel: async (modelId: string, timeoutMs?: number) =>
+          await turnController.setSessionModel(modelId, timeoutMs),
         setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
           return await turnController.setSessionConfigOption(configId, value, timeoutMs);
         },

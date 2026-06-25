@@ -577,6 +577,10 @@ async function spawnAndWait(
   if (spawnCommand.killProcessGroup) {
     spawnOptions.detached = true;
   }
+  // ACP terminal/create is a permission-gated command-execution surface.
+  // CodeQL otherwise treats the intentional shell fallback as accidental injection.
+  // codeql[js/shell-command-injection-from-environment]
+  // lgtm[js/shell-command-injection-from-environment]
   const proc = spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
   await waitForSpawn(proc);
   return proc;

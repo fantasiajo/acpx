@@ -38,6 +38,13 @@ acpx config init
   "ttl": 300,
   "timeout": null,
   "format": "text",
+  "mcpServers": [
+    {
+      "name": "local-tools",
+      "type": "stdio",
+      "command": "./bin/mcp-server"
+    }
+  ],
   "agents": {
     "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
   },
@@ -56,10 +63,22 @@ acpx config init
 | `ttl`                       | integer          | `300`             | Queue owner idle TTL in seconds. `0` disables idle shutdown.                                       |
 | `timeout`                   | number \| `null` | `null`            | Default `--timeout` in seconds (decimal allowed).                                                  |
 | `format`                    | enum             | `"text"`          | Default `--format`.                                                                                |
+| `mcpServers`                | array            | `[]`              | MCP servers sent to new and loaded ACP sessions. Project values replace global values.             |
 | `agents`                    | object           | `{}`              | Override or add agent commands (see below).                                                        |
 | `auth`                      | object           | `{}`              | ACP auth-method credential map (see below).                                                        |
 
 CLI flags always override these values. For example, `--approve-all` wins over `defaultPermissions: "deny-all"`.
+
+Use `--mcp-config <path>` when MCP servers belong to a session or automation job rather than the
+working tree. The file must contain the same top-level `mcpServers` array shown above; it replaces
+the project/global `mcpServers` value for that invocation. Relative paths resolve from `--cwd`.
+
+```bash
+acpx --cwd /workspace --mcp-config /run/job-mcp.json codex 'use the configured tools'
+```
+
+An existing persistent session cannot switch MCP configurations while its queue owner is live.
+Close that session first, then retry with the new `--mcp-config` file.
 
 ## The `agents` map
 
@@ -124,7 +143,12 @@ finds a matching `ACPX_AUTH_*` environment variable or `auth` config value.
 
 ## Environment variables
 
-`acpx` does not define new env vars beyond `ACPX_AUTH_*`. Other ACP-relevant behavior:
+`ACPX_CLAUDE_INCLUDE_USER_SETTINGS=1` makes built-in `claude` sessions include
+Claude Code user settings. By default, they load only project and local settings
+to avoid globally enabled channel or daemon plugins interfering with spawned ACP
+sessions.
+
+Other ACP-relevant behavior:
 
 - Session storage path is derived from the OS home directory (`~/.acpx/sessions`).
 - Child adapter processes inherit the current environment by default.
